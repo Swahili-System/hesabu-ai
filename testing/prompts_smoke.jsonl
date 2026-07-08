@@ -1,0 +1,8 @@
+{"id":"p1","question":"Jumla ya 23 na 19 ni nini?","expected":"42"}
+{"id":"p2","question":"Toa 57 kutoka 104. Jibu ni nini?","expected":"47"}
+{"id":"p3","question":"Mara 8 kwa 7 ni ngapi?","expected":"56"}
+{"id":"p4","question":"Gawa 45 kwa 6. Toa jibu na baki.","expected":"7 baki 3"}
+{"id":"p5","question":"Nusu ya 3/4 ni nini?","expected":"3/8"}
+{"id":"p6","question":"Asilimia 25 ya 200 ni ngapi?","expected":"50"}
+{"id":"p7","question":"Kama kalamu moja ni shilingi 500, kalamu 6 ni shilingi ngapi?","expected":"3000"}
+{"id":"p8","question":"Wastani wa 4, 8, 10 ni ngapi?","expected":"7.33 au 7 1/3"}

@@ -5,4 +5,9 @@ __pycache__/
 .swift_module_cache/
 outputs/
 .DS_Store
+.venv/
+.local-python-dev/
+unsloth_compiled_cache/
+testing/results/
+*.deb
 

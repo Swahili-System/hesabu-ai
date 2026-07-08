@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""QLoRA fine-tune Qwen3-14B on the Swahili primary math dataset (Unsloth + TRL).
-
-Run on the GPU box after `prepare_sft_dataset.py` has produced
-data/sft/train.jsonl and data/sft/val.jsonl.
-"""
+"""QLoRA fine-tune Qwen models without Unsloth (Transformers + PEFT + TRL)."""
 
 from __future__ import annotations
 
@@ -12,17 +8,19 @@ import json
 import os
 from pathlib import Path
 
-from unsloth import FastLanguageModel
+import torch
 from datasets import load_dataset
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from trl import SFTConfig, SFTTrainer
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--base-model", default="unsloth/Qwen3-14B")
+    parser.add_argument("--base-model", default="Qwen/Qwen2.5-1.5B-Instruct")
     parser.add_argument("--train-file", default="data/sft/train.jsonl")
     parser.add_argument("--val-file", default="data/sft/val.jsonl")
-    parser.add_argument("--output-dir", default="outputs/sdt-flare-qn-14-hisabati")
+    parser.add_argument("--output-dir", default="outputs/smoke-qwen25-1p5b-hisabati-hf")
     parser.add_argument("--max-seq-length", type=int, default=2048)
     parser.add_argument("--lora-r", type=int, default=32)
     parser.add_argument("--epochs", type=float, default=3.0)
@@ -36,37 +34,63 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-steps", type=int, default=100)
     parser.add_argument("--max-steps", type=int, default=-1)
     parser.add_argument("--report-to", default="tensorboard")
+    parser.add_argument("--local-files-only", action="store_true")
+    parser.add_argument("--offline", action="store_true")
+    parser.add_argument("--merge-system-into-user", action="store_true")
     return parser.parse_args()
 
 
-def load_model(args: argparse.Namespace):
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=args.base_model,
-        max_seq_length=args.max_seq_length,
-        load_in_4bit=True,
-        dtype=None,
+def load_model_and_tokenizer(args: argparse.Namespace):
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.base_model,
+        use_fast=True,
+        local_files_only=args.local_files_only,
     )
-    model = FastLanguageModel.get_peft_model(
-        model,
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    quant_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+    )
+    model = AutoModelForCausalLM.from_pretrained(
+        args.base_model,
+        quantization_config=quant_config,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        local_files_only=args.local_files_only,
+    )
+    model = prepare_model_for_kbit_training(model)
+    lora_config = LoraConfig(
         r=args.lora_r,
         lora_alpha=args.lora_r,
-        lora_dropout=0,
+        lora_dropout=0.0,
         bias="none",
-        target_modules=[
-            "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj",
-        ],
-        use_gradient_checkpointing="unsloth",
+        task_type="CAUSAL_LM",
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
     )
+    model = get_peft_model(model, lora_config)
     return model, tokenizer
 
 
-def render_chat_text(example: dict, tokenizer) -> dict:
+def merge_system_into_user(messages: list[dict]) -> list[dict]:
+    system_text = next((m["content"] for m in messages if m.get("role") == "system"), None)
+    merged = [m for m in messages if m.get("role") != "system"]
+    if system_text and merged and merged[0].get("role") == "user":
+        merged[0] = {"role": "user", "content": f"{system_text}\n\n{merged[0]['content']}"}
+    return merged
+
+
+def render_chat_text(example: dict, tokenizer, merge_system: bool) -> dict:
+    messages = example["messages"]
+    if merge_system:
+        messages = merge_system_into_user(messages)
     text = tokenizer.apply_chat_template(
-        example["messages"],
+        messages,
         tokenize=False,
         add_generation_prompt=False,
-        enable_thinking=False,
     )
     return {"text": text}
 
@@ -83,14 +107,22 @@ def write_run_summary(output_dir: str, train_metrics: dict, eval_metrics: dict) 
 
 def main() -> None:
     args = parse_args()
+    if args.offline:
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        args.local_files_only = True
     if "tensorboard" in str(args.report_to):
         os.environ["TENSORBOARD_LOGGING_DIR"] = f"{args.output_dir}/logs"
-    model, tokenizer = load_model(args)
+    model, tokenizer = load_model_and_tokenizer(args)
 
     train_dataset = load_dataset("json", data_files=args.train_file, split="train")
     val_dataset = load_dataset("json", data_files=args.val_file, split="train")
-    train_dataset = train_dataset.map(lambda example: render_chat_text(example, tokenizer))
-    val_dataset = val_dataset.map(lambda example: render_chat_text(example, tokenizer))
+    train_dataset = train_dataset.map(
+        lambda example: render_chat_text(example, tokenizer, args.merge_system_into_user)
+    )
+    val_dataset = val_dataset.map(
+        lambda example: render_chat_text(example, tokenizer, args.merge_system_into_user)
+    )
 
     trainer = SFTTrainer(
         model=model,
@@ -122,6 +154,7 @@ def main() -> None:
             max_length=args.max_seq_length,
         ),
     )
+
     train_result = trainer.train()
     eval_metrics = trainer.evaluate()
     trainer.save_metrics("train", train_result.metrics)
@@ -129,10 +162,9 @@ def main() -> None:
     trainer.save_state()
     write_run_summary(args.output_dir, train_result.metrics, eval_metrics)
 
-    merged_dir = f"{args.output_dir}/merged-16bit"
-    model.save_pretrained_merged(merged_dir, tokenizer, save_method="merged_16bit")
-    print(f"LoRA adapter + trainer state saved to {args.output_dir}")
-    print(f"Merged 16-bit model saved to {merged_dir}")
+    trainer.model.save_pretrained(args.output_dir)
+    tokenizer.save_pretrained(args.output_dir)
+    print(f"LoRA adapter + tokenizer saved to {args.output_dir}")
 
 
 if __name__ == "__main__":
